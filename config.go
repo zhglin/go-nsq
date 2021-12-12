@@ -32,16 +32,19 @@ type defaultsHandler interface {
 
 // BackoffStrategy defines a strategy for calculating the duration of time
 // a consumer should backoff for a given attempt
+// 定义一个策略，用于计算用户在给定的尝试中应该放弃的时间长度
 type BackoffStrategy interface {
 	Calculate(attempt int) time.Duration
 }
 
 // ExponentialStrategy implements an exponential backoff strategy (default)
+// 实现指数后退策略(默认)
 type ExponentialStrategy struct {
 	cfg *Config
 }
 
 // Calculate returns a duration of time: 2 ^ attempt
+// 返回一个持续时间:2 ^ attempt
 func (s *ExponentialStrategy) Calculate(attempt int) time.Duration {
 	backoffDuration := s.cfg.BackoffMultiplier *
 		time.Duration(math.Pow(2, float64(attempt)))
@@ -53,6 +56,7 @@ func (s *ExponentialStrategy) setConfig(cfg *Config) {
 }
 
 // FullJitterStrategy implements http://www.awsarchitectureblog.com/2015/03/backoff.html
+// 随机指数退避
 type FullJitterStrategy struct {
 	cfg *Config
 
@@ -61,8 +65,10 @@ type FullJitterStrategy struct {
 }
 
 // Calculate returns a random duration of time [0, 2 ^ attempt]
+// 返回一个随机持续时间[0,2 ^ attempt]
 func (s *FullJitterStrategy) Calculate(attempt int) time.Duration {
 	// lazily initialize the RNG
+	// 惰性初始化RNG
 	s.rngOnce.Do(func() {
 		if s.rng != nil {
 			return
@@ -92,14 +98,16 @@ type Config struct {
 	// used to Initialize, Validate
 	configHandlers []configHandler
 
+	// tcp连接的超时时间
 	DialTimeout time.Duration `opt:"dial_timeout" default:"1s"`
 
-	// Deadlines for network reads and writes
+	// Deadlines for network reads and writes 网络读写的期限
 	ReadTimeout  time.Duration `opt:"read_timeout" min:"100ms" max:"5m" default:"60s"`
 	WriteTimeout time.Duration `opt:"write_timeout" min:"100ms" max:"5m" default:"1s"`
 
 	// LocalAddr is the local address to use when dialing an nsqd.
 	// If empty, a local address is automatically chosen.
+	// 连接nsqd时要使用的本地地址。如果为空，则自动选择本地地址。
 	LocalAddr net.Addr `opt:"local_addr"`
 
 	// Duration between polling lookupd for new producers, and fractional jitter to add to
@@ -113,17 +121,22 @@ type Config struct {
 	LookupdPollTimeout  time.Duration `opt:"lookupd_poll_timeout" default:"1m"`
 
 	// Maximum duration when REQueueing (for doubling of deferred requeue)
+	// requeue命令的最大延迟时间
 	MaxRequeueDelay     time.Duration `opt:"max_requeue_delay" min:"0" max:"60m" default:"15m"`
 	DefaultRequeueDelay time.Duration `opt:"default_requeue_delay" min:"0" max:"60m" default:"90s"`
 
 	// Backoff strategy, defaults to exponential backoff. Overwrite this to define alternative backoff algrithms.
+	// 后退策略，默认为指数后退。改写此选项以定义可选的回退算法。
 	BackoffStrategy BackoffStrategy `opt:"backoff_strategy" default:"exponential"`
 	// Maximum amount of time to backoff when processing fails 0 == no backoff
+	// 处理失败时退出的最大时间量0 ==没有回退
 	MaxBackoffDuration time.Duration `opt:"max_backoff_duration" min:"0" max:"60m" default:"2m"`
 	// Unit of time for calculating consumer backoff
+	// 计算消费者后退的时间单位
 	BackoffMultiplier time.Duration `opt:"backoff_multiplier" min:"0" max:"60m" default:"1s"`
 
 	// Maximum number of times this consumer will attempt to process a message before giving up
+	// 在放弃之前尝试处理消息的最大次数
 	MaxAttempts uint16 `opt:"max_attempts" min:"0" max:"65535" default:"5"`
 
 	// Duration to wait for a message from an nsqd when in a state where RDY
@@ -136,14 +149,14 @@ type Config struct {
 
 	// Identifiers sent to nsqd representing this client
 	// UserAgent is in the spirit of HTTP (default: "<client_library_name>/<version>")
-	ClientID  string `opt:"client_id"` // (defaults: short hostname)
-	Hostname  string `opt:"hostname"`
-	UserAgent string `opt:"user_agent"`
+	ClientID  string `opt:"client_id"`  // (defaults: short hostname) 客户端标识符 默认hostName
+	Hostname  string `opt:"hostname"`   // 客户端hostName
+	UserAgent string `opt:"user_agent"` // 用户代理
 
 	// Duration of time between heartbeats. This must be less than ReadTimeout
-	HeartbeatInterval time.Duration `opt:"heartbeat_interval" default:"30s"`
+	HeartbeatInterval time.Duration `opt:"heartbeat_interval" default:"30s"` // nsqd定时发送的心跳检查
 	// Integer percentage to sample the channel (requires nsqd 0.2.25+)
-	SampleRate int32 `opt:"sample_rate" min:"0" max:"99"`
+	SampleRate int32 `opt:"sample_rate" min:"0" max:"99"` // 将收到的所有消息的一定百分比传送到此连接。
 
 	// To set TLS config, use the following options:
 	//
@@ -154,10 +167,11 @@ type Config struct {
 	// tls_key - String path to file containing private key for certificate
 	// tls_min_version - String indicating the minimum version of tls acceptable ('ssl3.0', 'tls1.0', 'tls1.1', 'tls1.2')
 	//
+	// TLS相关配置
 	TlsV1     bool        `opt:"tls_v1"`
 	TlsConfig *tls.Config `opt:"tls_config"`
 
-	// Compression Settings
+	// Compression Settings 报文压缩配置
 	Deflate      bool `opt:"deflate"`
 	DeflateLevel int  `opt:"deflate_level" min:"1" max:"9" default:"6"`
 	Snappy       bool `opt:"snappy"`
@@ -172,12 +186,14 @@ type Config struct {
 	OutputBufferTimeout time.Duration `opt:"output_buffer_timeout" default:"250ms"`
 
 	// Maximum number of messages to allow in flight (concurrency knob)
+	// 允许发送的最大消息数(并发旋钮)
 	MaxInFlight int `opt:"max_in_flight" min:"0" default:"1"`
 
 	// The server-side message timeout for messages delivered to this client
-	MsgTimeout time.Duration `opt:"msg_timeout" min:"0"`
+	MsgTimeout time.Duration `opt:"msg_timeout" min:"0"` // 为传递到此客户端的消息配置服务器端消息超时
 
 	// Secret for nsqd authentication (requires nsqd 0.2.29+)
+	// 用户认证
 	AuthSecret string `opt:"auth_secret"`
 	// Use AuthSecret as 'Authorization: Bearer {AuthSecret}' on lookupd queries
 	LookupdAuthorization bool `opt:"skip_lookupd_authorization" default:"true"`

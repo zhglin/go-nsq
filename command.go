@@ -10,14 +10,14 @@ import (
 	"time"
 )
 
-var byteSpace = []byte(" ")
-var byteNewLine = []byte("\n")
+var byteSpace = []byte(" ")    // command参数的间隔符
+var byteNewLine = []byte("\n") // 参数与body的分隔符
 
 // Command represents a command from a client to an NSQ daemon
 type Command struct {
-	Name   []byte
-	Params [][]byte
-	Body   []byte
+	Name   []byte   // 命令名
+	Params [][]byte // 参数
+	Body   []byte   // 报文
 }
 
 // String returns the name and parameters of the Command
@@ -33,44 +33,49 @@ func (c *Command) String() string {
 //
 // It is suggested that the target Writer is buffered
 // to avoid performing many system calls.
+// 实现WriterTo接口并将命令序列化到所提供的Writer。
+// 建议缓冲目标Writer以避免执行许多系统调用。
 func (c *Command) WriteTo(w io.Writer) (int64, error) {
 	var total int64
 	var buf [4]byte
 
+	// 写入命令名称
 	n, err := w.Write(c.Name)
 	total += int64(n)
 	if err != nil {
 		return total, err
 	}
 
+	// 写入命令参数
 	for _, param := range c.Params {
-		n, err := w.Write(byteSpace)
+		n, err := w.Write(byteSpace) // 参数间隔符
 		total += int64(n)
 		if err != nil {
 			return total, err
 		}
-		n, err = w.Write(param)
+		n, err = w.Write(param) // 写入参数
 		total += int64(n)
 		if err != nil {
 			return total, err
 		}
 	}
 
-	n, err = w.Write(byteNewLine)
+	n, err = w.Write(byteNewLine) // 与body的分隔符
 	total += int64(n)
 	if err != nil {
 		return total, err
 	}
 
+	// 写入body
 	if c.Body != nil {
 		bufs := buf[:]
-		binary.BigEndian.PutUint32(bufs, uint32(len(c.Body)))
+		binary.BigEndian.PutUint32(bufs, uint32(len(c.Body))) // body长度
 		n, err := w.Write(bufs)
 		total += int64(n)
 		if err != nil {
 			return total, err
 		}
-		n, err = w.Write(c.Body)
+		n, err = w.Write(c.Body) // body内容
 		total += int64(n)
 		if err != nil {
 			return total, err

@@ -30,16 +30,18 @@ type IdentifyResponse struct {
 
 // AuthResponse represents the metadata
 // returned from an AUTH command to nsqd
+// 表示从AUTH命令返回到nsqd的元数据
 type AuthResponse struct {
 	Identity        string `json:"identity"`
 	IdentityUrl     string `json:"identity_url"`
 	PermissionCount int64  `json:"permission_count"`
 }
 
+//  message的响应信息
 type msgResponse struct {
-	msg     *Message
-	cmd     *Command
-	success bool
+	msg     *Message // 原始信息
+	cmd     *Command // 需要发送个nsqd的命令
+	success bool     // 是否消费成功
 	backoff bool
 }
 
@@ -47,45 +49,48 @@ type msgResponse struct {
 //
 // Conn exposes a set of callbacks for the
 // various events that occur on a connection
+// Conn表示到nsqd的连接
+// Conn为连接上发生的各种事件公开一组回调
 type Conn struct {
 	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
-	messagesInFlight int64
-	maxRdyCount      int64
-	rdyCount         int64
+	messagesInFlight int64 // inFlight消息数量
+	maxRdyCount      int64 // 准备接收消息的数量 nsqd返回的配置
+	rdyCount         int64 // 当前链接的rdy数量
 	lastRdyTimestamp int64
-	lastMsgTimestamp int64
+	lastMsgTimestamp int64 // 接收到最后一条message的时间
 
 	mtx sync.Mutex
 
-	config *Config
+	config *Config // 配置
 
 	conn    *net.TCPConn
 	tlsConn *tls.Conn
-	addr    string
+	addr    string // 连接地址
 
-	delegate ConnDelegate
+	delegate ConnDelegate // 各种回调
 
 	logger   []logger
 	logLvl   LogLevel
 	logFmt   []string
 	logGuard sync.RWMutex
 
-	r io.Reader
-	w io.Writer
+	r io.Reader // tcp链接
+	w io.Writer // tcp链接
 
-	cmdChan         chan *Command
-	msgResponseChan chan *msgResponse
+	cmdChan         chan *Command     // 需要想nsqd发送的命令
+	msgResponseChan chan *msgResponse // message需要响应给nsqd的命令
 	exitChan        chan int
 	drainReady      chan int
 
-	closeFlag int32
+	closeFlag int32 // 关闭tcp链接的标记，不在读取tcp数据
 	stopper   sync.Once
 	wg        sync.WaitGroup
 
-	readLoopRunning int32
+	readLoopRunning int32 // 标记是否循环读取tcp
 }
 
 // NewConn returns a new Conn instance
+// 返回一个新的Conn实例
 func NewConn(addr string, config *Config, delegate ConnDelegate) *Conn {
 	if !config.initialized {
 		panic("Config must be created with NewConfig()")
@@ -170,6 +175,7 @@ func (c *Conn) getLogLevel() LogLevel {
 
 // Connect dials and bootstraps the nsqd connection
 // (including IDENTIFY) and returns the IdentifyResponse
+// nsqd连接(包括IDENTIFY)并返回IdentifyResponse
 func (c *Conn) Connect() (*IdentifyResponse, error) {
 	dialer := &net.Dialer{
 		LocalAddr: c.config.LocalAddr,
@@ -180,26 +186,29 @@ func (c *Conn) Connect() (*IdentifyResponse, error) {
 	if err != nil {
 		return nil, err
 	}
-	c.conn = conn.(*net.TCPConn)
+	c.conn = conn.(*net.TCPConn) // 强制类型转换
 	c.r = conn
 	c.w = conn
 
-	_, err = c.Write(MagicV2)
+	_, err = c.Write(MagicV2) // 发送协议版本号
 	if err != nil {
 		c.Close()
 		return nil, fmt.Errorf("[%s] failed to write magic - %s", c.addr, err)
 	}
 
+	// 发送并接收identify请求以及相应
 	resp, err := c.identify()
 	if err != nil {
 		return nil, err
 	}
 
+	// 必须需要进行auth认证
 	if resp != nil && resp.AuthRequired {
 		if c.config.AuthSecret == "" {
 			c.log(LogLevelError, "Auth Required")
 			return nil, errors.New("Auth Required")
 		}
+		// 发送auth认证
 		err := c.auth(c.config.AuthSecret)
 		if err != nil {
 			c.log(LogLevelError, "Auth Failed %s", err)
@@ -209,16 +218,17 @@ func (c *Conn) Connect() (*IdentifyResponse, error) {
 
 	c.wg.Add(2)
 	atomic.StoreInt32(&c.readLoopRunning, 1)
-	go c.readLoop()
-	go c.writeLoop()
+	go c.readLoop()  // 异步读取nsqd响应
+	go c.writeLoop() // 异步写入command
 	return resp, nil
 }
 
 // Close idempotently initiates connection close
+// 幂等地启动连接关闭
 func (c *Conn) Close() error {
 	atomic.StoreInt32(&c.closeFlag, 1)
 	if c.conn != nil && atomic.LoadInt64(&c.messagesInFlight) == 0 {
-		return c.conn.CloseRead()
+		return c.conn.CloseRead() // 关闭TCP连接的读取
 	}
 	return nil
 }
@@ -231,6 +241,7 @@ func (c *Conn) IsClosing() bool {
 }
 
 // RDY returns the current RDY count
+// 返回当前RDY计数
 func (c *Conn) RDY() int64 {
 	return atomic.LoadInt64(&c.rdyCount)
 }
@@ -250,6 +261,7 @@ func (c *Conn) SetRDY(rdy int64) {
 
 // MaxRDY returns the nsqd negotiated maximum
 // RDY count that it will accept for this connection
+// 返回该连接将接受的nsqd协商的最大RDY计数
 func (c *Conn) MaxRDY() int64 {
 	return c.maxRdyCount
 }
@@ -272,6 +284,7 @@ func (c *Conn) RemoteAddr() net.Addr {
 }
 
 // String returns the fully-qualified address
+// 返回nsqd的网络地址
 func (c *Conn) String() string {
 	return c.addr
 }
@@ -283,6 +296,7 @@ func (c *Conn) Read(p []byte) (int, error) {
 }
 
 // Write performs a deadlined write on the underlying TCP connection
+// 对底层TCP连接执行截止日期写入
 func (c *Conn) Write(p []byte) (int, error) {
 	c.conn.SetWriteDeadline(time.Now().Add(c.config.WriteTimeout))
 	return c.w.Write(p)
@@ -290,20 +304,23 @@ func (c *Conn) Write(p []byte) (int, error) {
 
 // WriteCommand is a goroutine safe method to write a Command
 // to this connection, and flush.
+// 在这个连接上写入命令并刷新 是一个goroutine安全的方法。
 func (c *Conn) WriteCommand(cmd *Command) error {
 	c.mtx.Lock()
 
+	// 发送command
 	_, err := cmd.WriteTo(c)
 	if err != nil {
 		goto exit
 	}
+	// 刷新缓冲数据
 	err = c.Flush()
 
 exit:
 	c.mtx.Unlock()
 	if err != nil {
 		c.log(LogLevelError, "IO error - %s", err)
-		c.delegate.OnIOError(c, err)
+		c.delegate.OnIOError(c, err) // 写入异常
 	}
 	return err
 }
@@ -313,6 +330,7 @@ type flusher interface {
 }
 
 // Flush writes all buffered data to the underlying TCP connection
+// 将所有缓冲数据写入底层TCP连接
 func (c *Conn) Flush() error {
 	if f, ok := c.w.(flusher); ok {
 		return f.Flush()
@@ -320,6 +338,7 @@ func (c *Conn) Flush() error {
 	return nil
 }
 
+// 发送identify报文
 func (c *Conn) identify() (*IdentifyResponse, error) {
 	ci := make(map[string]interface{})
 	ci["client_id"] = c.config.ClientID
@@ -350,22 +369,26 @@ func (c *Conn) identify() (*IdentifyResponse, error) {
 		return nil, ErrIdentify{err.Error()}
 	}
 
+	// 写入identify请求
 	err = c.WriteCommand(cmd)
 	if err != nil {
 		return nil, ErrIdentify{err.Error()}
 	}
 
+	// 读取响应
 	frameType, data, err := ReadUnpackedResponse(c)
 	if err != nil {
 		return nil, ErrIdentify{err.Error()}
 	}
 
+	// 异常的响应
 	if frameType == FrameTypeError {
 		return nil, ErrIdentify{string(data)}
 	}
 
 	// check to see if the server was able to respond w/ capabilities
 	// i.e. it was a JSON response
+	// 非json格式
 	if data[0] != '{' {
 		return nil, nil
 	}
@@ -378,6 +401,7 @@ func (c *Conn) identify() (*IdentifyResponse, error) {
 
 	c.log(LogLevelDebug, "IDENTIFY response: %+v", resp)
 
+	// 服务器支持的消息数量
 	c.maxRdyCount = resp.MaxRdyCount
 
 	if resp.TLSv1 {
@@ -406,14 +430,16 @@ func (c *Conn) identify() (*IdentifyResponse, error) {
 
 	// now that connection is bootstrapped, enable read buffering
 	// (and write buffering if it's not already capable of Flush())
+	// 现在连接已经启动，启用读缓冲(如果还不能使用Flush()则启用写缓冲)
 	c.r = bufio.NewReader(c.r)
-	if _, ok := c.w.(flusher); !ok {
+	if _, ok := c.w.(flusher); !ok { // 不具有缓冲功能
 		c.w = bufio.NewWriter(c.w)
 	}
 
 	return resp, nil
 }
 
+// 客户端升级tls
 func (c *Conn) upgradeTLS(tlsConf *tls.Config) error {
 	host, _, err := net.SplitHostPort(c.addr)
 	if err != nil {
@@ -444,6 +470,7 @@ func (c *Conn) upgradeTLS(tlsConf *tls.Config) error {
 	return nil
 }
 
+// 客户端升级deflate压缩
 func (c *Conn) upgradeDeflate(level int) error {
 	conn := net.Conn(c.conn)
 	if c.tlsConn != nil {
@@ -462,6 +489,7 @@ func (c *Conn) upgradeDeflate(level int) error {
 	return nil
 }
 
+// 客户端升级snappy压缩
 func (c *Conn) upgradeSnappy() error {
 	conn := net.Conn(c.conn)
 	if c.tlsConn != nil {
@@ -479,22 +507,26 @@ func (c *Conn) upgradeSnappy() error {
 	return nil
 }
 
+// 同nsqd进行auth认证
 func (c *Conn) auth(secret string) error {
 	cmd, err := Auth(secret)
 	if err != nil {
 		return err
 	}
 
+	// 写入auth命令
 	err = c.WriteCommand(cmd)
 	if err != nil {
 		return err
 	}
 
+	// 读取auth认证结果
 	frameType, data, err := ReadUnpackedResponse(c)
 	if err != nil {
 		return err
 	}
 
+	// 异常相应报文
 	if frameType == FrameTypeError {
 		return errors.New("Error authenticating " + string(data))
 	}
@@ -511,18 +543,25 @@ func (c *Conn) auth(secret string) error {
 	return nil
 }
 
+// 循环读取tcp报文
 func (c *Conn) readLoop() {
 	delegate := &connMessageDelegate{c}
 	for {
+		// 链接已关闭
 		if atomic.LoadInt32(&c.closeFlag) == 1 {
 			goto exit
 		}
 
+		// 读取响应内容
 		frameType, data, err := ReadUnpackedResponse(c)
+		// 读取失败
 		if err != nil {
+			// 已经被关闭
 			if err == io.EOF && atomic.LoadInt32(&c.closeFlag) == 1 {
 				goto exit
 			}
+
+			// 读取已关闭的链接
 			if !strings.Contains(err.Error(), "use of closed network connection") {
 				c.log(LogLevelError, "IO error - %s", err)
 				c.delegate.OnIOError(c, err)
@@ -530,9 +569,11 @@ func (c *Conn) readLoop() {
 			goto exit
 		}
 
+		// 服务器端的心跳包
 		if frameType == FrameTypeResponse && bytes.Equal(data, []byte("_heartbeat_")) {
 			c.log(LogLevelDebug, "heartbeat received")
-			c.delegate.OnHeartbeat(c)
+			c.delegate.OnHeartbeat(c) // 回调
+			// 写入空操作命令 校验写入是否正常
 			err := c.WriteCommand(Nop())
 			if err != nil {
 				c.log(LogLevelError, "IO error - %s", err)
@@ -543,23 +584,23 @@ func (c *Conn) readLoop() {
 		}
 
 		switch frameType {
-		case FrameTypeResponse:
+		case FrameTypeResponse: // 响应消息
 			c.delegate.OnResponse(c, data)
-		case FrameTypeMessage:
-			msg, err := DecodeMessage(data)
+		case FrameTypeMessage: // message消息
+			msg, err := DecodeMessage(data) // 反序列化message
 			if err != nil {
 				c.log(LogLevelError, "IO error - %s", err)
 				c.delegate.OnIOError(c, err)
 				goto exit
 			}
-			msg.Delegate = delegate
-			msg.NSQDAddress = c.String()
+			msg.Delegate = delegate      // 回调函数
+			msg.NSQDAddress = c.String() // nsqd网络地址
 
 			atomic.AddInt64(&c.messagesInFlight, 1)
 			atomic.StoreInt64(&c.lastMsgTimestamp, time.Now().UnixNano())
 
 			c.delegate.OnMessage(c, msg)
-		case FrameTypeError:
+		case FrameTypeError: // 异常响应的报文
 			c.log(LogLevelError, "protocol error - %s", data)
 			c.delegate.OnError(c, data)
 		default:
@@ -569,13 +610,14 @@ func (c *Conn) readLoop() {
 	}
 
 exit:
-	atomic.StoreInt32(&c.readLoopRunning, 0)
+	atomic.StoreInt32(&c.readLoopRunning, 0) // 标记不再读取tcp消息
 	// start the connection close
 	messagesInFlight := atomic.LoadInt64(&c.messagesInFlight)
 	if messagesInFlight == 0 {
 		// if we exited readLoop with no messages in flight
 		// we need to explicitly trigger the close because
 		// writeLoop won't
+		// 如果我们在没有消息的情况下退出了readLoop，我们需要显式地触发关闭，因为writeLoop不会
 		c.close()
 	} else {
 		c.log(LogLevelWarning, "delaying close, %d outstanding messages", messagesInFlight)
@@ -606,10 +648,10 @@ func (c *Conn) writeLoop() {
 			if resp.success {
 				c.log(LogLevelDebug, "FIN %s", resp.msg.ID)
 				c.delegate.OnMessageFinished(c, resp.msg)
-				c.delegate.OnResume(c)
+				c.delegate.OnResume(c) // 消息发送成功 关闭回退
 			} else {
 				c.log(LogLevelDebug, "REQ %s", resp.msg.ID)
-				c.delegate.OnMessageRequeued(c, resp.msg)
+				c.delegate.OnMessageRequeued(c, resp.msg) // 消费失败，重新写入队列
 				if resp.backoff {
 					c.delegate.OnBackoff(c)
 				} else {
@@ -729,11 +771,12 @@ func (c *Conn) onMessageFinish(m *Message) {
 	c.msgResponseChan <- &msgResponse{msg: m, cmd: Finish(m.ID), success: true}
 }
 
+// 重新写入队列
 func (c *Conn) onMessageRequeue(m *Message, delay time.Duration, backoff bool) {
 	if delay == -1 {
-		// linear delay
+		// linear delay  线性延迟
 		delay = c.config.DefaultRequeueDelay * time.Duration(m.Attempts)
-		// bound the requeueDelay to configured max
+		// bound the requeueDelay to configured max 绑定requeueDelay到配置的最大
 		if delay > c.config.MaxRequeueDelay {
 			delay = c.config.MaxRequeueDelay
 		}
@@ -741,6 +784,7 @@ func (c *Conn) onMessageRequeue(m *Message, delay time.Duration, backoff bool) {
 	c.msgResponseChan <- &msgResponse{msg: m, cmd: Requeue(m.ID, delay), success: false, backoff: backoff}
 }
 
+// 重置消息超时时间
 func (c *Conn) onMessageTouch(m *Message) {
 	select {
 	case c.cmdChan <- Touch(m.ID):

@@ -16,18 +16,19 @@ type MessageID [MsgIDLength]byte
 
 // Message is the fundamental data type containing
 // the id, body, and metadata
+// Message是包含id、主体和元数据的基本数据类型
 type Message struct {
-	ID        MessageID
-	Body      []byte
-	Timestamp int64
-	Attempts  uint16
+	ID        MessageID // 消息id
+	Body      []byte    // 消息内容
+	Timestamp int64     // 时间戳
+	Attempts  uint16    // 接收次数
 
-	NSQDAddress string
+	NSQDAddress string // nsqd的网络地址
 
-	Delegate MessageDelegate
+	Delegate MessageDelegate // 回调函数
 
-	autoResponseDisabled int32
-	responded            int32
+	autoResponseDisabled int32 // 是否自动fin req
+	responded            int32 // 是否已回复此消息 fin requeue touch
 }
 
 // NewMessage creates a Message, initializes some metadata,
@@ -46,6 +47,8 @@ func NewMessage(id MessageID, body []byte) *Message {
 //
 // This is useful if you want to batch, buffer, or asynchronously
 // respond to messages.
+// 禁用处理程序时通常会发送的自动响应。
+// HandleMessage返回(FIN/REQ基于返回的错误值)。如果您想对消息进行批处理、缓冲或异步响应，这将非常有用。
 func (m *Message) DisableAutoResponse() {
 	atomic.StoreInt32(&m.autoResponseDisabled, 1)
 }
@@ -57,13 +60,16 @@ func (m *Message) IsAutoResponseDisabled() bool {
 }
 
 // HasResponded indicates whether or not this message has been responded to
+// 指示是否已响应此消息
 func (m *Message) HasResponded() bool {
 	return atomic.LoadInt32(&m.responded) == 1
 }
 
 // Finish sends a FIN command to the nsqd which
 // sent this message
+// 向发送此消息的nsqd发送FIN命令
 func (m *Message) Finish() {
+	// 是否已发送响应
 	if !atomic.CompareAndSwapInt32(&m.responded, 0, 1) {
 		return
 	}
@@ -72,6 +78,7 @@ func (m *Message) Finish() {
 
 // Touch sends a TOUCH command to the nsqd which
 // sent this message
+// 向发送此消息的nsqd发送TOUCH命令
 func (m *Message) Touch() {
 	if m.HasResponded() {
 		return
@@ -85,6 +92,8 @@ func (m *Message) Touch() {
 // A delay of -1 will automatically calculate
 // based on the number of attempts and the
 // configured default_requeue_delay
+// 使用提供的延迟向发送此消息的nsqd发送REQ命令。
+// 延迟为-1将根据尝试次数和配置的default_requeue_delay自动计算
 func (m *Message) Requeue(delay time.Duration) {
 	m.doRequeue(delay, true)
 }
@@ -94,6 +103,8 @@ func (m *Message) Requeue(delay time.Duration) {
 //
 // Notably, using this method to respond does not trigger a backoff
 // event on the configured Delegate.
+// 使用提供的延迟向发送此消息的nsqd发送REQ命令。
+// 值得注意的是，使用此方法响应不会触发配置的委派上的回退事件。
 func (m *Message) RequeueWithoutBackoff(delay time.Duration) {
 	m.doRequeue(delay, false)
 }
@@ -148,6 +159,7 @@ func (m *Message) WriteTo(w io.Writer) (int64, error) {
 //                         (uint16)
 //                          2-byte
 //                         attempts
+// 反序列化数据(以[]byte)并创建新的Message消息格式
 func DecodeMessage(b []byte) (*Message, error) {
 	var msg Message
 
