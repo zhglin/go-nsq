@@ -56,7 +56,7 @@ type Conn struct {
 	messagesInFlight int64 // inFlight消息数量
 	maxRdyCount      int64 // 准备接收消息的数量 nsqd返回的配置
 	rdyCount         int64 // 当前链接的rdy数量
-	lastRdyTimestamp int64
+	lastRdyTimestamp int64 // 最后一次更新rdy数量的时间
 	lastMsgTimestamp int64 // 接收到最后一条message的时间
 
 	mtx sync.Mutex
@@ -79,8 +79,8 @@ type Conn struct {
 
 	cmdChan         chan *Command     // 需要想nsqd发送的命令
 	msgResponseChan chan *msgResponse // message需要响应给nsqd的命令
-	exitChan        chan int
-	drainReady      chan int
+	exitChan        chan int          // 通知writeLoop关闭
+	drainReady      chan int          //writeLoop已关闭的通知
 
 	closeFlag int32 // 关闭tcp链接的标记，不在读取tcp数据
 	stopper   sync.Once
@@ -224,7 +224,7 @@ func (c *Conn) Connect() (*IdentifyResponse, error) {
 }
 
 // Close idempotently initiates connection close
-// 幂等地启动连接关闭
+// 幂等地启动连接关闭 只关闭读
 func (c *Conn) Close() error {
 	atomic.StoreInt32(&c.closeFlag, 1)
 	if c.conn != nil && atomic.LoadInt64(&c.messagesInFlight) == 0 {
@@ -247,11 +247,13 @@ func (c *Conn) RDY() int64 {
 }
 
 // LastRDY returns the previously set RDY count
+// 返回之前设置的RDY计数
 func (c *Conn) LastRDY() int64 {
 	return atomic.LoadInt64(&c.rdyCount)
 }
 
 // SetRDY stores the specified RDY count
+// 存储指定的RDY计数
 func (c *Conn) SetRDY(rdy int64) {
 	atomic.StoreInt64(&c.rdyCount, rdy)
 	if rdy > 0 {
@@ -268,12 +270,14 @@ func (c *Conn) MaxRDY() int64 {
 
 // LastRdyTime returns the time of the last non-zero RDY
 // update for this connection
+// 返回此连接最后一次非零RDY更新的时间
 func (c *Conn) LastRdyTime() time.Time {
 	return time.Unix(0, atomic.LoadInt64(&c.lastRdyTimestamp))
 }
 
 // LastMessageTime returns a time.Time representing
 // the time at which the last message was received
+// 返回一个时间。表示接收最后一条消息的时间
 func (c *Conn) LastMessageTime() time.Time {
 	return time.Unix(0, atomic.LoadInt64(&c.lastMsgTimestamp))
 }
@@ -626,12 +630,15 @@ exit:
 	c.log(LogLevelInfo, "readLoop exiting")
 }
 
+// 命令异步写入
+// 这里的c.close之后不能exit,需要先退出readLoop,在退出writeLoop
 func (c *Conn) writeLoop() {
 	for {
 		select {
 		case <-c.exitChan:
 			c.log(LogLevelInfo, "breaking out of writeLoop")
 			// Indicate drainReady because we will not pull any more off msgResponseChan
+			// 指示drainReady，因为我们不会再从msgResponseChan上拉任何东西了
 			close(c.drainReady)
 			goto exit
 		case cmd := <-c.cmdChan:
@@ -679,6 +686,7 @@ exit:
 	c.log(LogLevelInfo, "writeLoop exiting")
 }
 
+// 链接读写异常的关闭  关闭读写
 func (c *Conn) close() {
 	// a "clean" connection close is orchestrated as follows:
 	//
@@ -707,8 +715,8 @@ func (c *Conn) close() {
 	//
 	c.stopper.Do(func() {
 		c.log(LogLevelInfo, "beginning close")
-		close(c.exitChan)
-		c.conn.CloseRead()
+		close(c.exitChan)  // 关闭writeLoop
+		c.conn.CloseRead() // 不在读取数据,会关闭readLoop()
 
 		c.wg.Add(1)
 		go c.cleanup()
@@ -717,15 +725,18 @@ func (c *Conn) close() {
 	})
 }
 
+// 关闭时的清理，等待readLoop关闭
 func (c *Conn) cleanup() {
 	<-c.drainReady
 	ticker := time.NewTicker(100 * time.Millisecond)
 	lastWarning := time.Now()
 	// writeLoop has exited, drain any remaining in flight messages
+	// writeLoop已退出，并将飞行消息中的所有剩余部分清空
 	for {
 		// we're racing with readLoop which potentially has a message
 		// for handling so infinitely loop until messagesInFlight == 0
 		// and readLoop has exited
+		// 我们正在与readLoop赛跑，它可能有一个消息来处理无限循环，直到messagesInFlight == 0和readLoop退出
 		var msgsInFlight int64
 		select {
 		case <-c.msgResponseChan:
@@ -742,6 +753,7 @@ func (c *Conn) cleanup() {
 		}
 		// until the readLoop has exited we cannot be sure that there
 		// still won't be a race
+		// 除非readLoop已经退出，否则我们不能确定是否还会有竞争
 		if atomic.LoadInt32(&c.readLoopRunning) == 1 {
 			if time.Now().Sub(lastWarning) > time.Second {
 				c.log(LogLevelWarning, "draining... readLoop still running")
@@ -758,9 +770,11 @@ exit:
 	c.log(LogLevelInfo, "finished draining, cleanup exiting")
 }
 
+// 等待所有协程退出
 func (c *Conn) waitForCleanup() {
 	// this blocks until readLoop and writeLoop
 	// (and cleanup goroutine above) have exited
+	// 直到readLoop和writelloop(以及上面的cleanup goroutine)退出
 	c.wg.Wait()
 	c.conn.CloseWrite()
 	c.log(LogLevelInfo, "clean close complete")

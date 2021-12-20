@@ -141,10 +141,13 @@ type Config struct {
 
 	// Duration to wait for a message from an nsqd when in a state where RDY
 	// counts are re-distributed (e.g. max_in_flight < num_producers)
+	// 多长时间没收到消息更新rdy数量为0
 	LowRdyIdleTimeout time.Duration `opt:"low_rdy_idle_timeout" min:"1s" max:"5m" default:"10s"`
 	// Duration to wait until redistributing RDY for an nsqd regardless of LowRdyIdleTimeout
+	// 等待一个nsqd重新分发RDY的时间，不管LowRdyIdleTimeout是多少
 	LowRdyTimeout time.Duration `opt:"low_rdy_timeout" min:"1s" max:"5m" default:"30s"`
 	// Duration between redistributing max-in-flight to connections
+	// 重新分配rdy的间隔时间
 	RDYRedistributeInterval time.Duration `opt:"rdy_redistribute_interval" min:"1ms" max:"5s" default:"5s"`
 
 	// Identifiers sent to nsqd representing this client
@@ -190,7 +193,8 @@ type Config struct {
 	MaxInFlight int `opt:"max_in_flight" min:"0" default:"1"`
 
 	// The server-side message timeout for messages delivered to this client
-	MsgTimeout time.Duration `opt:"msg_timeout" min:"0"` // 为传递到此客户端的消息配置服务器端消息超时
+	// 为传递到此客户端的消息配置服务器端消息超时
+	MsgTimeout time.Duration `opt:"msg_timeout" min:"0"`
 
 	// Secret for nsqd authentication (requires nsqd 0.2.29+)
 	// 用户认证

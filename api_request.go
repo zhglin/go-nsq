@@ -31,6 +31,7 @@ type wrappedResp struct {
 }
 
 // stores the result in the value pointed to by ret(must be a pointer)
+// 发送http请求，并将结果存储在ret所指向的值中(必须是一个指针)
 func apiRequestNegotiateV1(httpclient *http.Client, method string, endpoint string, headers http.Header, ret interface{}) error {
 	req, err := http.NewRequest(method, endpoint, nil)
 	if err != nil {

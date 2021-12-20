@@ -45,6 +45,7 @@ func (h HandlerFunc) HandleMessage(m *Message) error {
 
 // DiscoveryFilter is an interface accepted by `SetBehaviorDelegate()`
 // for filtering the nsqds returned from discovery via nsqlookupd
+// 是一个被' SetBehaviorDelegate() '接受的接口，用于过滤通过nsqlookupd发现返回的nsqds
 type DiscoveryFilter interface {
 	Filter([]string) []string
 }
@@ -88,12 +89,12 @@ const (
 type Consumer struct {
 	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
 	messagesReceived uint64 // 接收到消息的数量
-	messagesFinished uint64
-	messagesRequeued uint64
-	totalRdyCount    int64 // 已分配的所有链接总的Rdy
-	backoffDuration  int64 // consumer回退的时间
-	backoffCounter   int32 // message消费失败的次数
-	maxInFlight      int32 // 最大消息消费数量 inFlight数量
+	messagesFinished uint64 // fin消息数量
+	messagesRequeued uint64 // req消息数量
+	totalRdyCount    int64  // 已分配的所有链接总的Rdy
+	backoffDuration  int64  // consumer回退的时间
+	backoffCounter   int32  // message消费失败的次数
+	maxInFlight      int32  // 最大消息消费数量 inFlight数量
 
 	mtx sync.RWMutex
 
@@ -101,7 +102,7 @@ type Consumer struct {
 	logLvl   LogLevel
 	logGuard sync.RWMutex
 
-	behaviorDelegate interface{}
+	behaviorDelegate interface{} // 过滤lookupd发现nsqd的接口
 
 	id      int64  // 唯一编号
 	topic   string // topic名称
@@ -111,13 +112,13 @@ type Consumer struct {
 	rngMtx sync.Mutex
 	rng    *rand.Rand // 随机数相关
 
-	needRDYRedistributed int32
+	needRDYRedistributed int32 // 是否需要重新进行rdy分配
 
 	backoffMtx sync.Mutex
 
 	incomingMessages chan *Message // 接收到的消息
 
-	rdyRetryMtx    sync.Mutex
+	rdyRetryMtx    sync.Mutex             // rdyRetryTimers更新锁
 	rdyRetryTimers map[string]*time.Timer // 更新rdy的定时
 
 	pendingConnections map[string]*Conn // 存放订阅之前的conn
@@ -127,20 +128,20 @@ type Consumer struct {
 
 	// used at connection close to force a possible reconnect
 	lookupdRecheckChan chan int
-	lookupdHTTPAddrs   []string
-	lookupdQueryIndex  int
-	lookupdHttpClient  *http.Client
+	lookupdHTTPAddrs   []string     // 以构建的查询lookupd的地址
+	lookupdQueryIndex  int          // 轮询lookupdHTTPAddrs的下标
+	lookupdHttpClient  *http.Client // 公用的lookupd客户端
 
 	wg              sync.WaitGroup
-	runningHandlers int32
-	stopFlag        int32 // 是否已停止
-	connectedFlag   int32
+	runningHandlers int32 // message回调的并发协程数
+	stopFlag        int32 // 主动停止 先stop 后exit
+	connectedFlag   int32 // 已调用ConnectTo的标记
 	stopHandler     sync.Once
 	exitHandler     sync.Once
 
 	// read from this channel to block until consumer is cleanly stopped
-	StopChan chan int
-	exitChan chan int // 退出信号
+	StopChan chan int // 从该通道读取到阻塞，直到消费者完全停止 Stop()
+	exitChan chan int // 退出信号 退出各个协程
 }
 
 // NewConsumer creates a new instance of Consumer for the specified topic/channel
@@ -195,7 +196,7 @@ func NewConsumer(topic string, channel string, config *Config) (*Consumer, error
 	}
 
 	r.wg.Add(1)
-	go r.rdyLoop()
+	go r.rdyLoop() // 定时分配rdy
 	return r, nil
 }
 
@@ -209,6 +210,7 @@ func (r *Consumer) Stats() *ConsumerStats {
 	}
 }
 
+// 获取所有已订阅的链接
 func (r *Consumer) conns() []*Conn {
 	r.mtx.RLock()
 	conns := make([]*Conn, 0, len(r.connections))
@@ -271,7 +273,7 @@ func (r *Consumer) getLogLevel() LogLevel {
 // of the `Consumer`:
 //
 //    DiscoveryFilter
-//
+// SetBehaviorDelegate接受一个类型实现一个或多个接口，这些接口修改了' Consumer '的行为
 func (r *Consumer) SetBehaviorDelegate(cb interface{}) {
 	matched := false
 
@@ -322,6 +324,8 @@ func (r *Consumer) getMaxInFlight() int32 {
 // For example, ChangeMaxInFlight(0) would pause message flow
 //
 // If already connected, it updates the reader RDY state for each connection.
+// ChangeMaxInFlight设置此消费者实例将允许的最大消息数，并适当更新所有现有连接。
+// 例如，ChangeMaxInFlight(0)将暂停消息流。如果已经连接，则更新每个连接的读取器RDY状态。
 func (r *Consumer) ChangeMaxInFlight(maxInFlight int) {
 	if r.getMaxInFlight() == int32(maxInFlight) {
 		return
@@ -334,7 +338,8 @@ func (r *Consumer) ChangeMaxInFlight(maxInFlight int) {
 	}
 }
 
-// set lookupd http client
+// SetLookupdHttpClient set lookupd http client
+// 手动设置lookupdHttpClient
 func (r *Consumer) SetLookupdHttpClient(httpclient *http.Client) {
 	r.lookupdHttpClient = httpclient
 }
@@ -345,6 +350,9 @@ func (r *Consumer) SetLookupdHttpClient(httpclient *http.Client) {
 // producers for the configured topic.
 //
 // A goroutine is spawned to handle continual polling.
+// ConnectToNSQLookupd将nsqlookupd地址添加到该Consumer实例的列表中。
+// 如果它是第一个添加的，它发起一个HTTP请求来发现配置主题的nsqd生产者。
+// 生成一个goroutine来处理连续的轮询。
 func (r *Consumer) ConnectToNSQLookupd(addr string) error {
 	if atomic.LoadInt32(&r.stopFlag) == 1 {
 		return errors.New("consumer stopped")
@@ -353,6 +361,7 @@ func (r *Consumer) ConnectToNSQLookupd(addr string) error {
 		return errors.New("no handlers")
 	}
 
+	// 查询lookUp地址
 	parsedAddr, err := buildLookupAddr(addr, r.topic)
 	if err != nil {
 		return err
@@ -360,6 +369,7 @@ func (r *Consumer) ConnectToNSQLookupd(addr string) error {
 
 	atomic.StoreInt32(&r.connectedFlag, 1)
 
+	// 是否已处理过
 	r.mtx.Lock()
 	for _, x := range r.lookupdHTTPAddrs {
 		if x == parsedAddr {
@@ -367,6 +377,7 @@ func (r *Consumer) ConnectToNSQLookupd(addr string) error {
 			return nil
 		}
 	}
+	// 记录已处理的lookupd
 	r.lookupdHTTPAddrs = append(r.lookupdHTTPAddrs, parsedAddr)
 	if r.lookupdHttpClient == nil {
 		transport := &http.Transport{
@@ -389,10 +400,11 @@ func (r *Consumer) ConnectToNSQLookupd(addr string) error {
 	r.mtx.Unlock()
 
 	// if this is the first one, kick off the go loop
+	// 如果这是第一个，启动go循环
 	if numLookupd == 1 {
-		r.queryLookupd()
+		r.queryLookupd() // 查找nsqd服务器
 		r.wg.Add(1)
-		go r.lookupdLoop()
+		go r.lookupdLoop() // 定时查找nsqd服务器
 	}
 
 	return nil
@@ -404,6 +416,9 @@ func (r *Consumer) ConnectToNSQLookupd(addr string) error {
 // producers for the configured topic.
 //
 // A goroutine is spawned to handle continual polling.
+// ConnectToNSQLookupds将多个nsqlookupd地址添加到此Consumer实例的列表中。
+// 如果添加第一个地址，它会发起一个HTTP请求来发现配置主题的nsqd生产者。
+// 生成一个goroutine来处理连续的轮询。
 func (r *Consumer) ConnectToNSQLookupds(addresses []string) error {
 	for _, addr := range addresses {
 		err := r.ConnectToNSQLookupd(addr)
@@ -415,15 +430,18 @@ func (r *Consumer) ConnectToNSQLookupds(addresses []string) error {
 }
 
 // poll all known lookup servers every LookupdPollInterval
+// 每个LookupdPollInterval轮询所有已知的查找服务器
 func (r *Consumer) lookupdLoop() {
 	// add some jitter so that multiple consumers discovering the same topic,
 	// when restarted at the same time, dont all connect at once.
+	// 添加一些抖动，以便多个用户发现同一主题时，当同时重启时，不会同时连接所有用户。
 	r.rngMtx.Lock()
 	jitter := time.Duration(int64(r.rng.Float64() *
 		r.config.LookupdPollJitter * float64(r.config.LookupdPollInterval)))
 	r.rngMtx.Unlock()
 	var ticker *time.Ticker
 
+	// 启动时间延后 防止同时启动
 	select {
 	case <-time.After(jitter):
 	case <-r.exitChan:
@@ -453,6 +471,7 @@ exit:
 
 // return the next lookupd endpoint to query
 // keeping track of which one was last used
+// 返回下一个查找端点以查询，并跟踪最后使用的端点
 func (r *Consumer) nextLookupdEndpoint() string {
 	r.mtx.RLock()
 	if r.lookupdQueryIndex >= len(r.lookupdHTTPAddrs) {
@@ -485,6 +504,7 @@ type peerInfo struct {
 // which nsqd's provide the topic we are consuming.
 //
 // initiate a connection to any new producers that are identified.
+// 向配置的nsqlookupd实例之一发出HTTP请求，以发现哪个nsqd提供了我们正在使用的主题。发起与任何被识别的新生产者的连接。
 func (r *Consumer) queryLookupd() {
 	retries := 0
 
@@ -498,6 +518,7 @@ retry:
 	if r.config.AuthSecret != "" && r.config.LookupdAuthorization {
 		headers.Set("Authorization", fmt.Sprintf("Bearer %s", r.config.AuthSecret))
 	}
+	// 获取指定topic的nsqd
 	err := apiRequestNegotiateV1(r.lookupdHttpClient, "GET", endpoint, headers, &data)
 	if err != nil {
 		r.log(LogLevelError, "error querying nsqlookupd (%s) - %s", endpoint, err)
@@ -509,6 +530,7 @@ retry:
 		return
 	}
 
+	// 构建nsqd的地址
 	var nsqdAddrs []string
 	for _, producer := range data.Producers {
 		broadcastAddress := producer.BroadcastAddress
@@ -516,10 +538,13 @@ retry:
 		joined := net.JoinHostPort(broadcastAddress, strconv.Itoa(port))
 		nsqdAddrs = append(nsqdAddrs, joined)
 	}
-	// apply filter
+
+	// apply filter 应用过滤器
 	if discoveryFilter, ok := r.behaviorDelegate.(DiscoveryFilter); ok {
 		nsqdAddrs = discoveryFilter.Filter(nsqdAddrs)
 	}
+
+	// 链接nsqd跳过异常的节点
 	for _, addr := range nsqdAddrs {
 		err = r.ConnectToNSQD(addr)
 		if err != nil && err != ErrAlreadyConnected {
@@ -533,6 +558,9 @@ retry:
 //
 // It is recommended to use ConnectToNSQLookupd so that topics are discovered
 // automatically.  This method is useful when you want to connect to local instance.
+// 接受要直接连接到的多个NSQD地址。
+// 建议使用ConnectToNSQLookupd，以便自动发现主题。
+// 当您希望连接到本地实例时，此方法非常有用。
 func (r *Consumer) ConnectToNSQDs(addresses []string) error {
 	for _, addr := range addresses {
 		err := r.ConnectToNSQD(addr)
@@ -591,6 +619,7 @@ func (r *Consumer) ConnectToNSQD(addr string) error {
 		conn.Close()
 	}
 
+	// 建立链接 发送identify请求
 	resp, err := conn.Connect()
 	if err != nil {
 		cleanupConnection()
@@ -605,6 +634,7 @@ func (r *Consumer) ConnectToNSQD(addr string) error {
 		}
 	}
 
+	// 订阅topic，channel
 	cmd := Subscribe(r.topic, r.channel)
 	err = conn.WriteCommand(cmd)
 	if err != nil {
@@ -613,6 +643,7 @@ func (r *Consumer) ConnectToNSQD(addr string) error {
 			conn, r.topic, r.channel, err.Error())
 	}
 
+	// 已完成订阅的链接
 	r.mtx.Lock()
 	delete(r.pendingConnections, addr)
 	r.connections[addr] = conn
@@ -641,6 +672,7 @@ func indexOf(n string, h []string) int {
 
 // DisconnectFromNSQD closes the connection to and removes the specified
 // `nsqd` address from the list
+// 关闭到列表的连接并从列表中删除指定的“nsqd”地址，否则被关闭的链接会重新链接
 func (r *Consumer) DisconnectFromNSQD(addr string) error {
 	r.mtx.Lock()
 	defer r.mtx.Unlock()
@@ -690,6 +722,7 @@ func (r *Consumer) DisconnectFromNSQLookupd(addr string) error {
 	return nil
 }
 
+// 接收到消息回调
 func (r *Consumer) onConnMessage(c *Conn, msg *Message) {
 	atomic.AddUint64(&r.messagesReceived, 1)
 	r.incomingMessages <- msg
@@ -718,7 +751,7 @@ func (r *Consumer) onConnResume(c *Conn) {
 	r.startStopContinueBackoff(c, resumeFlag)
 }
 
-// 响应的回调 只处理close
+// 响应的回调 只处理close 关闭链接的读
 func (r *Consumer) onConnResponse(c *Conn, data []byte) {
 	switch {
 	case bytes.Equal(data, []byte("CLOSE_WAIT")):
@@ -738,18 +771,21 @@ func (r *Consumer) onConnError(c *Conn, data []byte) {}
 // consumer收到心跳包
 func (r *Consumer) onConnHeartbeat(c *Conn) {}
 
-// tcp链接错误
+// tcp链接读写的错误调用，之后会调用c.close关闭链接，关闭readLoop，writeLoop
 func (r *Consumer) onConnIOError(c *Conn, err error) {
-	c.Close()
+	c.Close() // 只关闭读
 }
 
+// 链接关闭后的回调
 func (r *Consumer) onConnClose(c *Conn) {
 	var hasRDYRetryTimer bool
 
 	// remove this connections RDY count from the consumer's total
+	// 从使用者的总数中删除此连接RDY计数
 	rdyCount := c.RDY()
 	atomic.AddInt64(&r.totalRdyCount, -rdyCount)
 
+	// 删除定时更新
 	r.rdyRetryMtx.Lock()
 	if timer, ok := r.rdyRetryTimers[c.String()]; ok {
 		// stop any pending retry of an old RDY update
@@ -759,6 +795,7 @@ func (r *Consumer) onConnClose(c *Conn) {
 	}
 	r.rdyRetryMtx.Unlock()
 
+	// 删除链接
 	r.mtx.Lock()
 	delete(r.connections, c.String())
 	left := len(r.connections)
@@ -773,6 +810,8 @@ func (r *Consumer) onConnClose(c *Conn) {
 		//
 		// trigger RDY redistribution to make sure this RDY is moved
 		// to a new connection
+		// 我们正在切换(正常)重新分配的情况，这个conn有一个RDY计数…
+		// 触发RDY再分配，以确保该RDY被移动到一个新的连接
 		atomic.StoreInt32(&r.needRDYRedistributed, 1)
 	}
 
@@ -786,10 +825,10 @@ func (r *Consumer) onConnClose(c *Conn) {
 
 	r.mtx.RLock()
 	numLookupd := len(r.lookupdHTTPAddrs)
-	reconnect := indexOf(c.String(), r.nsqdTCPAddrs) >= 0
+	reconnect := indexOf(c.String(), r.nsqdTCPAddrs) >= 0 // 非主动关闭的，重新连接
 	r.mtx.RUnlock()
 	if numLookupd > 0 {
-		// trigger a poll of the lookupd
+		// trigger a poll of the lookupd 触发对被查询对象的轮询，可能是nsqd服务问题
 		select {
 		case r.lookupdRecheckChan <- 1:
 		default:
@@ -797,13 +836,15 @@ func (r *Consumer) onConnClose(c *Conn) {
 	} else if reconnect {
 		// there are no lookupd and we still have this nsqd TCP address in our list...
 		// try to reconnect after a bit
+		// 没有查找，我们的列表中仍然有这个nsqd TCP地址…稍候再尝试重新连接
 		go func(addr string) {
 			for {
 				r.log(LogLevelInfo, "(%s) re-connecting in %s", addr, r.config.LookupdPollInterval)
 				time.Sleep(r.config.LookupdPollInterval)
-				if atomic.LoadInt32(&r.stopFlag) == 1 {
+				if atomic.LoadInt32(&r.stopFlag) == 1 { // 已退出了
 					break
 				}
+				// 重新校验是否手动删掉了
 				r.mtx.RLock()
 				reconnect := indexOf(addr, r.nsqdTCPAddrs) >= 0
 				r.mtx.RUnlock()
@@ -811,6 +852,7 @@ func (r *Consumer) onConnClose(c *Conn) {
 					r.log(LogLevelWarning, "(%s) skipped reconnect after removal...", addr)
 					return
 				}
+				// 链接
 				err := r.ConnectToNSQD(addr)
 				if err != nil && err != ErrAlreadyConnected {
 					r.log(LogLevelError, "(%s) error connecting to nsqd - %s", addr, err)
@@ -954,6 +996,7 @@ func (r *Consumer) maybeUpdateRDY(conn *Conn) {
 	}
 }
 
+// 定时重分配rdy数量
 func (r *Consumer) rdyLoop() {
 	redistributeTicker := time.NewTicker(r.config.RDYRedistributeInterval)
 
@@ -997,10 +1040,12 @@ func (r *Consumer) updateRDY(c *Conn, count int64) error {
 	// this could help a new connection get partial max-in-flight
 	// 飞行中消息数量永远不要超过我们的全球最大限额。如果可能的话,截断。这可以帮助新连接获得部分最大飞行数
 	rdyCount := c.RDY()
+	// 当前链接还能分配的最大rdy数量
 	maxPossibleRdy := int64(r.getMaxInFlight()) - atomic.LoadInt64(&r.totalRdyCount) + rdyCount
 	if maxPossibleRdy > 0 && maxPossibleRdy < count {
 		count = maxPossibleRdy
 	}
+	// 超过限额
 	if maxPossibleRdy <= 0 && count > 0 {
 		if rdyCount == 0 {
 			// we wanted to exit a zero RDY count but we couldn't send it...
@@ -1018,23 +1063,28 @@ func (r *Consumer) updateRDY(c *Conn, count int64) error {
 		return ErrOverMaxInFlight
 	}
 
+	// 设置rdy
 	return r.sendRDY(c, count)
 }
 
+// 设置链接rdy数量
 func (r *Consumer) sendRDY(c *Conn, count int64) error {
 	if count == 0 && c.LastRDY() == 0 {
 		// no need to send. It's already that RDY count
 		return nil
 	}
 
+	// 增加分配数量
 	atomic.AddInt64(&r.totalRdyCount, count-c.RDY())
 
+	// 记录
 	lastRDY := c.LastRDY()
 	c.SetRDY(count)
 	if count == lastRDY {
 		return nil
 	}
 
+	// 发送command命令
 	err := c.WriteCommand(Ready(int(count)))
 	if err != nil {
 		r.log(LogLevelError, "(%s) error sending RDY %d - %s", c.String(), count, err)
@@ -1043,18 +1093,22 @@ func (r *Consumer) sendRDY(c *Conn, count int64) error {
 	return nil
 }
 
+// 重新分配rdy数量
 func (r *Consumer) redistributeRDY() {
+	// 回退中跳过
 	if r.inBackoffTimeout() {
 		return
 	}
 
 	// if an external heuristic set needRDYRedistributed we want to wait
 	// until we can actually redistribute to proceed
+	// 如果一个外部启发式设置为needdrdyredistributed，我们想要等待，直到我们真正可以重新分配
 	conns := r.conns()
 	if len(conns) == 0 {
 		return
 	}
 
+	// 这种情况会有链接无法消费消息
 	maxInFlight := r.getMaxInFlight()
 	if len(conns) > int(maxInFlight) {
 		r.log(LogLevelDebug, "redistributing RDY state (%d conns > %d max_in_flight)",
@@ -1067,6 +1121,7 @@ func (r *Consumer) redistributeRDY() {
 		atomic.StoreInt32(&r.needRDYRedistributed, 1)
 	}
 
+	// 是否需要进行调整
 	if !atomic.CompareAndSwapInt32(&r.needRDYRedistributed, 1, 0) {
 		return
 	}
@@ -1078,11 +1133,11 @@ func (r *Consumer) redistributeRDY() {
 		rdyCount := c.RDY()
 		r.log(LogLevelDebug, "(%s) rdy: %d (last message received %s)",
 			c.String(), rdyCount, lastMsgDuration)
-		if rdyCount > 0 {
-			if lastMsgDuration > r.config.LowRdyIdleTimeout {
+		if rdyCount > 0 { // rdy大于0的情况下
+			if lastMsgDuration > r.config.LowRdyIdleTimeout { // 长时间未收到消息
 				r.log(LogLevelDebug, "(%s) idle connection, giving up RDY", c.String())
 				r.updateRDY(c, 0)
-			} else if lastRdyDuration > r.config.LowRdyTimeout {
+			} else if lastRdyDuration > r.config.LowRdyTimeout { // 长时间未更新rdy
 				r.log(LogLevelDebug, "(%s) RDY timeout, giving up RDY", c.String())
 				r.updateRDY(c, 0)
 			}
@@ -1090,6 +1145,7 @@ func (r *Consumer) redistributeRDY() {
 		possibleConns = append(possibleConns, c)
 	}
 
+	// 剩余可重新分配的数量
 	availableMaxInFlight := int64(maxInFlight) - atomic.LoadInt64(&r.totalRdyCount)
 	if r.inBackoff() {
 		availableMaxInFlight = 1 - atomic.LoadInt64(&r.totalRdyCount)
@@ -1121,9 +1177,10 @@ func (r *Consumer) Stop() {
 
 	r.log(LogLevelInfo, "stopping...")
 
+	// 所有链接已关闭
 	if len(r.conns()) == 0 {
 		r.stopHandlers()
-	} else {
+	} else { // 关闭所有链接
 		for _, c := range r.conns() {
 			err := c.WriteCommand(StartClose())
 			if err != nil {
@@ -1131,6 +1188,7 @@ func (r *Consumer) Stop() {
 			}
 		}
 
+		// 等待所有的conn关闭
 		time.AfterFunc(time.Second*30, func() {
 			// if we've waited this long handlers are blocked on processing messages
 			// so we can't just stopHandlers (if any adtl. messages were pending processing
@@ -1142,6 +1200,7 @@ func (r *Consumer) Stop() {
 	}
 }
 
+// 关闭incomingMessages
 func (r *Consumer) stopHandlers() {
 	r.stopHandler.Do(func() {
 		r.log(LogLevelInfo, "stopping handlers")
@@ -1155,6 +1214,8 @@ func (r *Consumer) stopHandlers() {
 // This panics if called after connecting to NSQD or NSQ Lookupd
 //
 // (see Handler or HandlerFunc for details on implementing this interface)
+// 为这个消费者接收的消息设置处理程序。这可以多次调用以添加其他处理程序。处理程序与消息处理goroutines的比率为1:1。
+// 连接到NSQD或NSQ Lookupd后调用，将会出现异常(参见Handler或HandlerFunc了解实现该接口的详细信息)
 func (r *Consumer) AddHandler(handler Handler) {
 	r.AddConcurrentHandlers(handler, 1)
 }
@@ -1166,6 +1227,9 @@ func (r *Consumer) AddHandler(handler Handler) {
 // This panics if called after connecting to NSQD or NSQ Lookupd
 //
 // (see Handler or HandlerFunc for details on implementing this interface)
+// AddConcurrentHandlers设置接收到的消息的处理程序。
+// 它接受第二个参数，该参数指示为消息处理而生成的goroute的数量。
+// 如果在连接到NSQD或NSQLookupd之后调用，则会出现异常(有关实现该接口的详细信息，请参阅Handler或HandlerFunc)
 func (r *Consumer) AddConcurrentHandlers(handler Handler, concurrency int) {
 	if atomic.LoadInt32(&r.connectedFlag) == 1 {
 		panic("already connected")
@@ -1230,6 +1294,7 @@ func (r *Consumer) shouldFailMessage(message *Message, handler interface{}) bool
 	return false
 }
 
+// consumer退出
 func (r *Consumer) exit() {
 	r.exitHandler.Do(func() {
 		close(r.exitChan)
@@ -1254,6 +1319,7 @@ func (r *Consumer) log(lvl LogLevel, line string, args ...interface{}) {
 		fmt.Sprintf(line, args...)))
 }
 
+// 构造lookUp的http地址
 func buildLookupAddr(addr, topic string) (string, error) {
 	urlString := addr
 	if !strings.Contains(urlString, "://") {
