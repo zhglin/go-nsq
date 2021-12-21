@@ -24,11 +24,13 @@ type producerConn interface {
 // A Producer instance is 1:1 with a destination `nsqd`
 // and will lazily connect to that instance (and re-connect)
 // when Publish commands are executed.
+// 生产者是发布到NSQ的高级类型。
+// 生产者实例与目的地' nsqd '的比例为1:1，当执行Publish命令时，生产者实例将延迟连接到该实例(并重新连接)。
 type Producer struct {
-	id     int64
-	addr   string
+	id     int64  // 自增的唯一号
+	addr   string // nsqd地址
 	conn   producerConn
-	config Config
+	config Config // 配置项
 
 	logger   []logger
 	logLvl   LogLevel
@@ -40,10 +42,10 @@ type Producer struct {
 
 	transactionChan chan *ProducerTransaction
 	transactions    []*ProducerTransaction
-	state           int32
+	state           int32 // 链接的状态
 
 	concurrentProducers int32
-	stopFlag            int32
+	stopFlag            int32 // stop的标记
 	exitChan            chan int
 	wg                  sync.WaitGroup
 	guard               sync.Mutex
@@ -52,6 +54,7 @@ type Producer struct {
 // ProducerTransaction is returned by the async publish methods
 // to retrieve metadata about the command after the
 // response is received.
+// ProducerTransaction由async publish方法返回，用于在收到响应后检索关于命令的元数据。
 type ProducerTransaction struct {
 	cmd      *Command
 	doneChan chan *ProducerTransaction
@@ -69,6 +72,9 @@ func (t *ProducerTransaction) finish() {
 //
 // The only valid way to create a Config is via NewConfig, using a struct literal will panic.
 // After Config is passed into NewProducer the values are no longer mutable (they are copied).
+// NewProducer返回指定地址的Producer实例
+// 创建Config的唯一有效方法是通过NewConfig，使用struct字面量将会恐慌。
+// Config被传入NewProducer后，值不再是可变的(它们被复制)。
 func NewProducer(addr string, config *Config) (*Producer, error) {
 	err := config.Validate()
 	if err != nil {
@@ -287,6 +293,7 @@ func (w *Producer) sendCommandAsync(cmd *Command, doneChan chan *ProducerTransac
 	return nil
 }
 
+// 延迟链接
 func (w *Producer) connect() error {
 	w.guard.Lock()
 	defer w.guard.Unlock()
@@ -334,6 +341,7 @@ func (w *Producer) close() {
 	go func() {
 		// we need to handle this in a goroutine so we don't
 		// block the caller from making progress
+		// 我们需要在goroutine中处理它，这样我们就不会阻止调用者取得进展
 		w.wg.Wait()
 		atomic.StoreInt32(&w.state, StateInit)
 	}()
